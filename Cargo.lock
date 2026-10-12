@@ -110,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dotenv",
+ "dotenvy",
  "gcp_auth",
  "redis",
  "reqwest",
