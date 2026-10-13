@@ -187,6 +187,7 @@ async fn main() {
     let protected = Router::new()
         .route("/api/me", get(auth::me))
         .route("/api/get-desa", get(get_desa_handler))
+        .route("/api/ekspor", post(auth::cek_ekspor))
         .route(
             "/api/osm-cache",
             get(osm_cache_get_handler).post(osm_cache_post_handler),

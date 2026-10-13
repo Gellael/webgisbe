@@ -604,3 +604,32 @@ pub async fn admin_add_kredit(
     tx.commit().await?;
     Ok(Json(json!({ "success": true, "saldo": saldo })))
 }
+
+#[derive(Deserialize)]
+pub struct EksporReq {
+    kabupaten: String,
+}
+
+pub async fn cek_ekspor(
+    State(pool): State<PgPool>,
+    Extension(user): Extension<DbUser>,
+    Json(req): Json<EksporReq>,
+) -> Result<Json<Value>, ApiError> {
+    if user.role == "admin" {
+        return Ok(Json(json!({ "ok": true })));
+    }
+    let aktif: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM peta_akses WHERE user_id = $1 AND kabupaten = $2 AND expires_at > now()",
+    )
+    .bind(user.id)
+    .bind(&req.kabupaten)
+    .fetch_optional(&pool)
+    .await?;
+    if aktif.is_none() {
+        return Err(ApiError(
+            StatusCode::PAYMENT_REQUIRED,
+            "Akses peta sudah berakhir. Muat ulang kabupaten (memakai kredit) untuk mengekspor.".into(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
