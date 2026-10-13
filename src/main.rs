@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 mod gee;
 
-// 1. API GET WILAYAH (Provinsi / Kabupaten)
 async fn get_wilayah_handler(
     State(pool): State<PgPool>,
     Query(params): Query<HashMap<String, String>>,
@@ -21,8 +20,8 @@ async fn get_wilayah_handler(
             SELECT DISTINCT "WADMKK" AS kabupaten
             FROM batas_wilayah
             WHERE "WADMPR" = $1
-              AND "WADMKK" IS NOT NULL
-              AND "WADMKK" != ''
+            AND "WADMKK" IS NOT NULL
+            AND "WADMKK" != ''
             ORDER BY kabupaten ASC;
         "#;
 
@@ -56,7 +55,6 @@ async fn get_wilayah_handler(
     }
 }
 
-// 2. API GET DESA (GeoJSON berdasarkan Kabupaten)
 async fn get_desa_handler(
     State(pool): State<PgPool>,
     Query(params): Query<HashMap<String, String>>,
@@ -95,7 +93,6 @@ async fn get_desa_handler(
     }
 }
 
-// 3. API OSM CACHE (GET & POST)
 #[derive(Deserialize)]
 struct OsmCachePayload {
     area: String,
@@ -150,13 +147,11 @@ async fn osm_cache_post_handler(
 
 #[tokio::main]
 async fn main() {
-    // Memuat variabel dari file .env lokal jika ada
     dotenvy::dotenv().ok();
 
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL belum diset. Isi di file .env atau environment server.");
 
-    // Pool dibuat sekali dan dibagikan ke semua handler
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

@@ -12,12 +12,12 @@ pub async fn gee_tiles(
     Query(q): Query<GeeQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let layer = q.layer.unwrap_or_else(|| "elevation".to_string());
-
-    // Daftar layer yang diizinkan. Tambah layer baru di sini.
     let graph = match layer.as_str() {
+        "elevation" => include_str!("../gee/elevation.json"),
         "ndwi" => include_str!("../gee/ndwi.json"),
         "ndvi" => include_str!("../gee/ndvi.json"),
-        "elevation" => include_str!("../gee/elevation.json"),
+        "bangunan" => include_str!("../gee/bangunan.json"),
+        "air" => include_str!("../gee/air.json"),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -29,7 +29,7 @@ pub async fn gee_tiles(
     match build_tile_url(graph).await {
         Ok(url) => Ok(Json(json!({ "tileUrl": url }))),
         Err(e) => {
-            eprintln!("GEE error: {e:#}"); // terlihat di Vercel Logs
+            eprintln!("GEE error ({layer}): {e:#}"); // terlihat di terminal / Vercel Logs
             Err((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": "gagal membuat tile Earth Engine" })),
@@ -39,12 +39,12 @@ pub async fn gee_tiles(
 }
 
 async fn build_tile_url(graph_json: &str) -> anyhow::Result<String> {
-let key_json = match std::env::var("GEE_SERVICE_ACCOUNT_JSON") {
-    Ok(v) => v,
-    Err(_) => std::fs::read_to_string("gee-key.json")?,
+    let key_json = match std::env::var("GEE_SERVICE_ACCOUNT_JSON") {
+        Ok(v) => v,
+        Err(_) => std::fs::read_to_string("gee-key.json")?,
     };
-let project = std::env::var("GEE_PROJECT_ID")
-    .unwrap_or_else(|_| "project-gis-494114".to_string());
+    let project = std::env::var("GEE_PROJECT_ID")
+        .unwrap_or_else(|_| "project-gis-494114".to_string());
 
     let sa = CustomServiceAccount::from_json(&key_json)?;
     let token = sa
