@@ -1,3 +1,4 @@
+// src/gee.rs
 use axum::{extract::Query, http::StatusCode, Json};
 use gcp_auth::{CustomServiceAccount, TokenProvider};
 use serde::Deserialize;
@@ -12,12 +13,17 @@ pub async fn gee_tiles(
     Query(q): Query<GeeQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let layer = q.layer.unwrap_or_else(|| "elevation".to_string());
+
+    // Daftar layer yang diizinkan. Setiap file JSON dibuat dari Console Earth Engine
+    // dengan: print(ee.Serializer.toCloudApiJSON(gambar));
+    // Semua file di bawah HARUS ada di folder gee/, kalau tidak build gagal.
     let graph = match layer.as_str() {
         "elevation" => include_str!("../gee/elevation.json"),
         "ndwi" => include_str!("../gee/ndwi.json"),
         "ndvi" => include_str!("../gee/ndvi.json"),
         "bangunan" => include_str!("../gee/bangunan.json"),
-        "air" => include_str!("../gee/air.json"),
+        "sungai" => include_str!("../gee/sungai.json"),
+        "jalan" => include_str!("../gee/jalan.json"),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -39,6 +45,7 @@ pub async fn gee_tiles(
 }
 
 async fn build_tile_url(graph_json: &str) -> anyhow::Result<String> {
+    // Di Vercel: env var. Di laptop: file gee-key.json di folder backend.
     let key_json = match std::env::var("GEE_SERVICE_ACCOUNT_JSON") {
         Ok(v) => v,
         Err(_) => std::fs::read_to_string("gee-key.json")?,
@@ -51,6 +58,7 @@ async fn build_tile_url(graph_json: &str) -> anyhow::Result<String> {
         .token(&["https://www.googleapis.com/auth/earthengine"])
         .await?;
 
+    // Boleh berisi JSON biasa, atau JSON yang dibungkus string (hasil salinan Console GEE)
     let expression: Value = match serde_json::from_str::<Value>(graph_json.trim())? {
         Value::String(inner) => serde_json::from_str(&inner)?,
         other => other,
