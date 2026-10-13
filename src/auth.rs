@@ -1,5 +1,5 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{rand_core::{OsRng, RngCore}, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use axum::{
@@ -12,6 +12,7 @@ use axum::{
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{
     collections::HashMap,
@@ -29,6 +30,19 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT NOT NULL DEFAULT 'user',
     kredit        INTEGER NOT NULL DEFAULT 0 CHECK (kredit >= 0),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Verifikasi email. User yang sudah ada saat kolom ini pertama kali ditambahkan dianggap terverifikasi
+-- (kolom ditambah dengan DEFAULT true, lalu default diganti false untuk pendaftar baru).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE users ALTER COLUMN email_verified SET DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS email_verifications (
+    user_id      BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code_hash    TEXT NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS topup_requests (
@@ -233,7 +247,81 @@ fn require_admin(user: &DbUser) -> Result<(), ApiError> {
     }
 }
 
-// ===================== REGISTER / LOGIN / ME =====================
+// ===================== REGISTER / LOGIN / VERIFIKASI EMAIL =====================
+const CODE_TTL_MIN: i32 = 15; // masa berlaku kode (menit)
+const RESEND_COOLDOWN_SEC: f64 = 60.0; // jeda minimal antar pengiriman kode
+const MAX_ATTEMPTS: i32 = 5; // salah input maksimal per kode
+
+/// Kode disimpan sebagai hash (bukan teks asli), diikat ke user_id + JWT_SECRET.
+fn hash_code(user_id: i64, code: &str) -> String {
+    let input = format!("{user_id}:{code}:{}", jwt_secret());
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+/// Kirim kode via SMTP. Env: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM (opsional), SMTP_PORT (opsional, default 587).
+async fn send_code_email(to: &str, nama: &str, code: &str) -> Result<(), String> {
+    use lettre::{
+        message::Mailbox, transport::smtp::authentication::Credentials, AsyncSmtpTransport, AsyncTransport, Message,
+        Tokio1Executor,
+    };
+    let host = env::var("SMTP_HOST").map_err(|_| "SMTP_HOST belum diset".to_string())?;
+    let user = env::var("SMTP_USER").map_err(|_| "SMTP_USER belum diset".to_string())?;
+    let pass = env::var("SMTP_PASS").map_err(|_| "SMTP_PASS belum diset".to_string())?;
+    let from = env::var("SMTP_FROM").unwrap_or_else(|_| user.clone());
+    let port: u16 = env::var("SMTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(587);
+
+    let msg = Message::builder()
+        .from(from.parse::<Mailbox>().map_err(|e| e.to_string())?)
+        .to(to.parse::<Mailbox>().map_err(|e| e.to_string())?)
+        .subject("Kode verifikasi Petakilat")
+        .body(format!(
+            "Halo {nama},\n\nKode verifikasi email Anda: {code}\n\nKode berlaku {CODE_TTL_MIN} menit. \
+             Jika Anda tidak merasa mendaftar di Petakilat, abaikan email ini.\n"
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let relay = if port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
+    };
+    let mailer = relay
+        .map_err(|e| e.to_string())?
+        .port(port)
+        .credentials(Credentials::new(user, pass))
+        .build();
+    mailer.send(msg).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Buat kode baru lalu kirim ke email. Ditolak (429) jika masih dalam masa jeda.
+async fn issue_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
+    let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
+    let r = sqlx::query(
+        "INSERT INTO email_verifications (user_id, code_hash, expires_at, attempts, last_sent_at)
+         VALUES ($1, $2, now() + make_interval(mins => $3), 0, now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at,
+               attempts = 0, last_sent_at = now()
+           WHERE email_verifications.last_sent_at < now() - make_interval(secs => $4)",
+    )
+    .bind(user.id)
+    .bind(hash_code(user.id, &code))
+    .bind(CODE_TTL_MIN)
+    .bind(RESEND_COOLDOWN_SEC)
+    .execute(pool)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Tunggu sekitar 1 menit sebelum meminta kode baru.".into(),
+        ));
+    }
+    send_code_email(&user.email, &user.nama, &code).await.map_err(|e| {
+        eprintln!("Gagal kirim email verifikasi ke {}: {e}", user.email);
+        ApiError(StatusCode::BAD_GATEWAY, "Gagal mengirim email verifikasi. Coba lagi nanti.".into())
+    })
+}
+
 #[derive(Deserialize)]
 pub struct RegisterReq {
     email: String,
@@ -241,10 +329,11 @@ pub struct RegisterReq {
     password: String,
 }
 
+/// Mendaftar TIDAK langsung memberi token. User harus verifikasi email dulu.
 pub async fn register(
     State(pool): State<PgPool>,
     Json(req): Json<RegisterReq>,
-) -> Result<Json<AuthResp>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let email = req.email.trim().to_lowercase();
     let nama = req.nama.trim().to_string();
     if !email.contains('@') || email.len() > 120 {
@@ -258,32 +347,30 @@ pub async fn register(
     }
 
     let hash = hash_pw(req.password).await?;
-    // Email di ADMIN_EMAIL otomatis menjadi admin saat mendaftar
+    // Email di ADMIN_EMAIL otomatis menjadi admin (tetap harus verifikasi email dulu sebelum bisa masuk)
     let is_admin = env::var("ADMIN_EMAIL")
         .map(|a| a.trim().to_lowercase() == email)
         .unwrap_or(false);
     let role = if is_admin { "admin" } else { "user" };
 
-    let row = sqlx::query_as::<_, DbUser>(
+    // Email yang sudah terdaftar tapi BELUM terverifikasi boleh mendaftar ulang (data ditimpa),
+    // supaya email tidak "terkunci" oleh pendaftaran yang tidak pernah diselesaikan.
+    let user: Option<DbUser> = sqlx::query_as(
         "INSERT INTO users (email, nama, password_hash, role) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (email) DO UPDATE SET nama = EXCLUDED.nama, password_hash = EXCLUDED.password_hash
+         WHERE users.email_verified = false
          RETURNING id, email, nama, password_hash, role, kredit",
     )
     .bind(&email)
     .bind(&nama)
     .bind(&hash)
     .bind(role)
-    .fetch_one(&pool)
-    .await;
+    .fetch_optional(&pool)
+    .await?;
+    let user = user.ok_or_else(|| ApiError(StatusCode::CONFLICT, "Email sudah terdaftar.".into()))?;
 
-    let user = match row {
-        Ok(u) => u,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(ApiError(StatusCode::CONFLICT, "Email sudah terdaftar.".into()))
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }))
+    issue_code(&pool, &user).await?;
+    Ok(Json(json!({ "needs_verification": true, "email": user.email })))
 }
 
 #[derive(Deserialize)]
@@ -295,7 +382,7 @@ pub struct LoginReq {
 pub async fn login(
     State(pool): State<PgPool>,
     Json(req): Json<LoginReq>,
-) -> Result<Json<AuthResp>, ApiError> {
+) -> Result<Response, ApiError> {
     let email = req.email.trim().to_lowercase();
     let user: Option<DbUser> = sqlx::query_as(
         "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE email = $1",
@@ -309,7 +396,102 @@ pub async fn login(
     if !verify_pw(req.password, user.password_hash.clone()).await {
         return Err(fail());
     }
+
+    let (verified,): (bool,) = sqlx::query_as("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await?;
+    if !verified {
+        // Kirim kode baru (diabaikan kalau masih masa jeda: kode sebelumnya masih berlaku)
+        let _ = issue_code(&pool, &user).await;
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Email belum diverifikasi. Masukkan kode yang dikirim ke email Anda.",
+                "code": "email_not_verified",
+                "email": user.email
+            })),
+        )
+            .into_response());
+    }
+    Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct VerifyReq {
+    email: String,
+    code: String,
+}
+
+pub async fn verify_email(
+    State(pool): State<PgPool>,
+    Json(req): Json<VerifyReq>,
+) -> Result<Json<AuthResp>, ApiError> {
+    let email = req.email.trim().to_lowercase();
+    let bad = || ApiError::bad("Kode salah.");
+    let user: Option<DbUser> = sqlx::query_as(
+        "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await?;
+    let user = user.ok_or_else(bad)?;
+
+    // Setiap percobaan dihitung secara atomik; kode mati setelah MAX_ATTEMPTS salah atau kedaluwarsa.
+    let row: Option<(String,)> = sqlx::query_as(
+        "UPDATE email_verifications SET attempts = attempts + 1
+         WHERE user_id = $1 AND attempts < $2 AND expires_at > now()
+         RETURNING code_hash",
+    )
+    .bind(user.id)
+    .bind(MAX_ATTEMPTS)
+    .fetch_optional(&pool)
+    .await?;
+    let (stored,) = row.ok_or_else(|| {
+        ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Kode kedaluwarsa atau terlalu banyak percobaan. Minta kode baru.".into(),
+        )
+    })?;
+    if stored != hash_code(user.id, req.code.trim()) {
+        return Err(bad());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM email_verifications WHERE user_id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
     Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }))
+}
+
+#[derive(Deserialize)]
+pub struct ResendReq {
+    email: String,
+}
+
+/// Jawaban selalu sama agar endpoint ini tidak bisa dipakai menebak email yang terdaftar.
+pub async fn resend_code(
+    State(pool): State<PgPool>,
+    Json(req): Json<ResendReq>,
+) -> Result<Json<Value>, ApiError> {
+    let email = req.email.trim().to_lowercase();
+    let user: Option<DbUser> = sqlx::query_as(
+        "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE email = $1 AND email_verified = false",
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await?;
+    if let Some(u) = user {
+        issue_code(&pool, &u).await?;
+    }
+    Ok(Json(json!({ "success": true })))
 }
 
 pub async fn me(Extension(user): Extension<DbUser>) -> Json<UserOut> {

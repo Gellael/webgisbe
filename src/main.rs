@@ -181,7 +181,9 @@ async fn main() {
     let public = Router::new()
         .route("/api/get-wilayah", get(get_wilayah_handler))
         .route("/api/auth/register", post(auth::register))
-        .route("/api/auth/login", post(auth::login));
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/verify", post(auth::verify_email))   
+        .route("/api/auth/resend", post(auth::resend_code));
 
     // ---- Rute wajib login ----
     let protected = Router::new()

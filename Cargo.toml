@@ -17,6 +17,8 @@ dotenvy = "0.15.7"
 anyhow = "1"
 argon2 = "0.5"
 jsonwebtoken = "9"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+sha2 = "0.10"
 
 [[bin]]
 name = "backend"
