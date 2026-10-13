@@ -317,66 +317,40 @@ pub async fn me(Extension(user): Extension<DbUser>) -> Json<UserOut> {
 }
 
 // ===================== PEMAKAIAN KREDIT =====================
-fn cost_per_map() -> i32 {
-    env::var("CREDIT_PER_MAP")
+// Aturan:
+//  - Membuka provinsi / kabupaten / desa : cukup punya kredit > 0 (TIDAK dipotong).
+//  - Ekspor PNG / PDF                    : kredit dipotong saat ekspor (lihat `cek_ekspor`).
+//  - Admin                               : tidak dicek dan tidak dipotong.
+fn cost_per_export() -> i32 {
+    env::var("CREDIT_PER_EXPORT")
+        .or_else(|_| env::var("CREDIT_PER_MAP")) // kompatibel dengan .env lama
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1)
 }
 
-/// Memotong kredit saat user membuat peta untuk satu kabupaten.
-/// Akses kabupaten yang sama gratis selama 24 jam (ganti desa / ubah tampilan tidak memotong lagi).
-/// Admin tidak dipotong.
-pub async fn charge_peta(pool: &PgPool, user: &DbUser, kabupaten: &str) -> Result<(), ApiError> {
-    if user.role == "admin" {
-        return Ok(());
-    }
-    let mut tx = pool.begin().await?;
-    // Kunci per user supaya dua request bersamaan tidak memotong dua kali
-    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(user.id).execute(&mut *tx).await?;
-
-    let aktif: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM peta_akses WHERE user_id = $1 AND kabupaten = $2 AND expires_at > now()",
+fn kredit_habis() -> ApiError {
+    ApiError(
+        StatusCode::PAYMENT_REQUIRED,
+        "Kredit Anda habis. Silakan top-up terlebih dahulu untuk mengakses peta.".into(),
     )
-    .bind(user.id)
-    .bind(kabupaten)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if aktif.is_some() {
-        return Ok(());
-    }
+}
 
-    let biaya = cost_per_map();
-    let upd = sqlx::query("UPDATE users SET kredit = kredit - $1 WHERE id = $2 AND kredit >= $1")
-        .bind(biaya)
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
-    if upd.rows_affected() == 0 {
-        return Err(ApiError(
-            StatusCode::PAYMENT_REQUIRED,
-            format!("Kredit tidak cukup. Dibutuhkan {biaya} kredit, silakan top-up terlebih dahulu."),
-        ));
+/// Gerbang akses: lolos jika admin atau kredit > 0. Tidak memotong kredit.
+/// `user.kredit` selalu segar karena dibaca ulang dari DB oleh `require_auth` di setiap request.
+fn cek_punya_kredit(user: &DbUser) -> Result<(), ApiError> {
+    if user.role == "admin" || user.kredit > 0 {
+        Ok(())
+    } else {
+        Err(kredit_habis())
     }
+}
 
-    sqlx::query("INSERT INTO kredit_log (user_id, delta, alasan, ref) VALUES ($1, $2, 'pakai-peta', $3)")
-        .bind(user.id)
-        .bind(-biaya)
-        .bind(kabupaten)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO peta_akses (user_id, kabupaten, expires_at)
-         VALUES ($1, $2, now() + interval '24 hours')
-         ON CONFLICT (user_id, kabupaten) DO UPDATE SET expires_at = EXCLUDED.expires_at",
-    )
-    .bind(user.id)
-    .bind(kabupaten)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(())
+/// Dipanggil oleh handler get-desa (main.rs). Nama dipertahankan supaya main.rs tidak perlu diubah,
+/// tetapi sekarang HANYA memeriksa kredit > 0 dan tidak memotong apa pun.
+pub async fn charge_peta(_pool: &PgPool, user: &DbUser, _kabupaten: &str) -> Result<(), ApiError> {
+    cek_punya_kredit(user)
 }
 
 // ===================== TOP-UP (USER) =====================
@@ -610,26 +584,41 @@ pub struct EksporReq {
     kabupaten: String,
 }
 
+/// Dipanggil tepat sebelum ekspor PNG/PDF. Di sinilah kredit dipotong (-1).
+/// UPDATE bersyarat (kredit >= biaya) bersifat atomik, jadi request bersamaan tidak bisa
+/// membuat saldo negatif maupun memotong dua kali untuk satu klik.
 pub async fn cek_ekspor(
     State(pool): State<PgPool>,
     Extension(user): Extension<DbUser>,
     Json(req): Json<EksporReq>,
 ) -> Result<Json<Value>, ApiError> {
     if user.role == "admin" {
-        return Ok(Json(json!({ "ok": true })));
+        return Ok(Json(json!({ "ok": true, "kredit": null })));
     }
-    let aktif: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM peta_akses WHERE user_id = $1 AND kabupaten = $2 AND expires_at > now()",
+    let biaya = cost_per_export();
+    let mut tx = pool.begin().await?;
+
+    let row: Option<(i32,)> = sqlx::query_as(
+        "UPDATE users SET kredit = kredit - $1 WHERE id = $2 AND kredit >= $1 RETURNING kredit",
     )
+    .bind(biaya)
     .bind(user.id)
-    .bind(&req.kabupaten)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    if aktif.is_none() {
-        return Err(ApiError(
+    let (sisa,) = row.ok_or_else(|| {
+        ApiError(
             StatusCode::PAYMENT_REQUIRED,
-            "Akses peta sudah berakhir. Muat ulang kabupaten (memakai kredit) untuk mengekspor.".into(),
-        ));
-    }
-    Ok(Json(json!({ "ok": true })))
+            format!("Kredit tidak cukup. Ekspor membutuhkan {biaya} kredit, silakan top-up terlebih dahulu."),
+        )
+    })?;
+
+    let ref_kab: String = req.kabupaten.chars().take(100).collect();
+    sqlx::query("INSERT INTO kredit_log (user_id, delta, alasan, ref) VALUES ($1, $2, 'ekspor', $3)")
+        .bind(user.id)
+        .bind(-biaya)
+        .bind(ref_kab)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true, "kredit": sisa })))
 }
