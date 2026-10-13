@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
+mod gee;
 
 // 1. API GET WILAYAH (Provinsi / Kabupaten)
 async fn get_wilayah_handler(
@@ -174,6 +175,7 @@ async fn main() {
             "/api/osm-cache",
             get(osm_cache_get_handler).post(osm_cache_post_handler),
         )
+        .route("/api/gee-tiles", axum::routing::get(gee::gee_tiles))    
         .layer(cors)
         .with_state(pool);
 
