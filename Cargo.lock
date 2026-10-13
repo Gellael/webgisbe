@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,8 +114,8 @@ dependencies = [
 name = "backend"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
- "dotenv",
  "dotenvy",
  "gcp_auth",
  "redis",
@@ -118,7 +124,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
- "tower-http 0.7.1",
+ "tower-http",
 ]
 
 [[package]]
@@ -339,12 +345,6 @@ dependencies = [
  "quote",
  "syn 3.0.8",
 ]
-
-[[package]]
-name = "dotenv"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
 name = "dotenvy"
@@ -1443,7 +1443,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tower",
- "tower-http 0.6.11",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -2203,21 +2203,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "url",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
-dependencies = [
- "bitflags",
- "bytes",
- "http",
- "percent-encoding",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
 ]
 
 [[package]]

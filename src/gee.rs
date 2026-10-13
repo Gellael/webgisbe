@@ -43,8 +43,8 @@ let key_json = match std::env::var("GEE_SERVICE_ACCOUNT_JSON") {
     Ok(v) => v,
     Err(_) => std::fs::read_to_string("gee-key.json")?,
     };
-    let project = std::env::var("GEE_PROJECT_ID")?
-        .unwrap_or_else(|_| "project-gis-494114".to_string());
+let project = std::env::var("GEE_PROJECT_ID")
+    .unwrap_or_else(|_| "project-gis-494114".to_string());
 
     let sa = CustomServiceAccount::from_json(&key_json)?;
     let token = sa
