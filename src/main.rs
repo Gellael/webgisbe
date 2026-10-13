@@ -1,6 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware,
     routing::{get, post},
     Extension, Json, Router,
@@ -175,7 +175,7 @@ async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     // ---- Rute publik ----
     let public = Router::new()
