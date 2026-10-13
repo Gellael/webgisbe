@@ -39,15 +39,22 @@ pub async fn gee_tiles(
 }
 
 async fn build_tile_url(graph_json: &str) -> anyhow::Result<String> {
-    let key_json = std::env::var("GEE_SERVICE_ACCOUNT_JSON")?;
-    let project = std::env::var("GEE_PROJECT_ID")?;
+let key_json = match std::env::var("GEE_SERVICE_ACCOUNT_JSON") {
+    Ok(v) => v,
+    Err(_) => std::fs::read_to_string("gee-key.json")?,
+    };
+    let project = std::env::var("GEE_PROJECT_ID")?
+        .unwrap_or_else(|_| "project-gis-494114".to_string());
 
     let sa = CustomServiceAccount::from_json(&key_json)?;
     let token = sa
         .token(&["https://www.googleapis.com/auth/earthengine"])
         .await?;
 
-    let expression: Value = serde_json::from_str(graph_json)?;
+    let expression: Value = match serde_json::from_str::<Value>(graph_json.trim())? {
+        Value::String(inner) => serde_json::from_str(&inner)?,
+        other => other,
+    };
 
     let resp = reqwest::Client::new()
         .post(format!(
