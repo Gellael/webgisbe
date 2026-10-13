@@ -259,10 +259,72 @@ fn hash_code(user_id: i64, code: &str) -> String {
 }
 
 /// Kirim kode via SMTP. Env: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM (opsional), SMTP_PORT (opsional, default 587).
+/// Escape karakter HTML supaya nama user tidak bisa menyisipkan tag ke email.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+const EMAIL_HTML: &str = r##"<!DOCTYPE html>
+<html lang="id">
+<body style="margin:0;padding:0;background-color:#f1f5f9;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9">
+<tr><td align="center" style="padding:32px 12px;">
+
+  <table role="presentation" width="480" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:480px;background-color:#ffffff;border-radius:16px;overflow:hidden;font-family:'Segoe UI',Helvetica,Arial,sans-serif;">
+
+    <!-- Header -->
+    <tr><td align="center" bgcolor="#0f172a" style="background-color:#0f172a;padding:28px 24px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td align="center" valign="middle" width="48" height="48" bgcolor="#facc15" style="background-color:#facc15;border-radius:12px;width:48px;height:48px;font-size:28px;line-height:48px;text-align:center;">&#9889;</td>
+        <td valign="middle" style="padding-left:12px;font-size:28px;font-weight:800;letter-spacing:0.5px;color:#ffffff;">Peta<span style="color:#facc15;">kilat</span></td>
+      </tr></table>
+      <div style="margin-top:8px;font-size:13px;color:#94a3b8;">Peta cepat, data tepat</div>
+    </td></tr>
+
+    <!-- Isi -->
+    <tr><td style="padding:32px 28px 8px 28px;color:#0f172a;">
+      <div style="font-size:20px;font-weight:700;margin-bottom:12px;">Halo, {{NAMA}} &#128075;</div>
+      <div style="font-size:15px;line-height:1.6;color:#334155;">
+        Terima kasih sudah mendaftar di Petakilat. Masukkan kode berikut untuk memverifikasi email Anda:
+      </div>
+    </td></tr>
+
+    <!-- Kode -->
+    <tr><td align="center" style="padding:20px 28px;">
+      <div style="display:inline-block;background-color:#fffbeb;border:2px dashed #facc15;border-radius:12px;padding:16px 28px;font-family:'Courier New',Consolas,monospace;font-size:36px;font-weight:800;letter-spacing:10px;color:#0f172a;">{{KODE}}</div>
+    </td></tr>
+
+    <tr><td style="padding:0 28px 28px 28px;">
+      <div style="font-size:14px;line-height:1.6;color:#64748b;text-align:center;">
+        Kode berlaku <strong style="color:#0f172a;">{{TTL}} menit</strong>.<br>
+        Demi keamanan, jangan bagikan kode ini kepada siapa pun.
+      </div>
+    </td></tr>
+
+    <!-- Footer -->
+    <tr><td bgcolor="#f8fafc" style="background-color:#f8fafc;padding:18px 28px;border-top:1px solid #e2e8f0;">
+      <div style="font-size:12px;line-height:1.6;color:#94a3b8;text-align:center;">
+        Tidak merasa mendaftar di Petakilat? Abaikan saja email ini.<br>
+        &copy; Petakilat &#9889;
+      </div>
+    </td></tr>
+
+  </table>
+
+</td></tr>
+</table>
+</body>
+</html>"##;
+
+/// Kirim kode via SMTP. Env: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM (opsional), SMTP_PORT (opsional, default 587).
 async fn send_code_email(to: &str, nama: &str, code: &str) -> Result<(), String> {
     use lettre::{
-        message::Mailbox, transport::smtp::authentication::Credentials, AsyncSmtpTransport, AsyncTransport, Message,
-        Tokio1Executor,
+        message::{Mailbox, MultiPart},
+        transport::smtp::authentication::Credentials,
+        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     };
     let host = env::var("SMTP_HOST").map_err(|_| "SMTP_HOST belum diset".to_string())?;
     let user = env::var("SMTP_USER").map_err(|_| "SMTP_USER belum diset".to_string())?;
@@ -270,14 +332,21 @@ async fn send_code_email(to: &str, nama: &str, code: &str) -> Result<(), String>
     let from = env::var("SMTP_FROM").unwrap_or_else(|_| user.clone());
     let port: u16 = env::var("SMTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(587);
 
+    let plain = format!(
+        "Halo {nama},\n\nKode verifikasi email Anda di Petakilat: {code}\n\n\
+         Kode berlaku {CODE_TTL_MIN} menit. Jangan bagikan kode ini kepada siapa pun.\n\
+         Jika Anda tidak merasa mendaftar di Petakilat, abaikan email ini.\n"
+    );
+    let html = EMAIL_HTML
+        .replace("{{NAMA}}", &html_escape(nama))
+        .replace("{{KODE}}", code)
+        .replace("{{TTL}}", &CODE_TTL_MIN.to_string());
+
     let msg = Message::builder()
         .from(from.parse::<Mailbox>().map_err(|e| e.to_string())?)
         .to(to.parse::<Mailbox>().map_err(|e| e.to_string())?)
-        .subject("Kode verifikasi Petakilat")
-        .body(format!(
-            "Halo {nama},\n\nKode verifikasi email Anda: {code}\n\nKode berlaku {CODE_TTL_MIN} menit. \
-             Jika Anda tidak merasa mendaftar di Petakilat, abaikan email ini.\n"
-        ))
+        .subject(format!("⚡ {code} adalah kode verifikasi Petakilat Anda"))
+        .multipart(MultiPart::alternative_plain_html(plain, html))
         .map_err(|e| e.to_string())?;
 
     let relay = if port == 465 {
