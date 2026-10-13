@@ -15,7 +15,6 @@ use tower_http::cors::{Any, CorsLayer};
 mod auth;
 mod gee;
 
-// Daftar provinsi / kabupaten (data nama saja) tetap publik
 async fn get_wilayah_handler(
     State(pool): State<PgPool>,
     Query(params): Query<HashMap<String, String>>,
@@ -184,8 +183,6 @@ async fn main() {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify", post(auth::verify_email))   
         .route("/api/auth/resend", post(auth::resend_code));
-
-    // ---- Rute wajib login ----
     let protected = Router::new()
         .route("/api/me", get(auth::me))
         .route("/api/get-desa", get(get_desa_handler))
