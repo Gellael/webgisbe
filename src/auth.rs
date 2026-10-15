@@ -3,7 +3,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Multipart, Path, Query, Request, State},
+    extract::{Query, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -142,27 +142,6 @@ pub struct AuthResp {
     token: String,
     user: UserOut,
 }
-
-#[derive(Serialize, sqlx::FromRow)]
-pub struct TopupOut {
-    id: i64,
-    email: String,
-    nama: String,
-    nominal: i64,
-    catatan: Option<String>,
-    status: String,
-    kredit_diberikan: Option<i32>,
-    alasan_admin: Option<String>,
-    dibuat: String,
-}
-
-const TOPUP_SELECT: &str = r#"
-    SELECT t.id, u.email, u.nama, t.nominal, t.catatan, t.status,
-           t.kredit_diberikan, t.alasan_admin,
-           to_char(t.created_at AT TIME ZONE 'Asia/Jakarta', 'DD Mon YYYY HH24:MI') AS dibuat
-    FROM topup_requests t
-    JOIN users u ON u.id = t.user_id
-"#;
 
 // ===================== JWT & PASSWORD =====================
 pub fn jwt_secret() -> &'static str {
@@ -584,7 +563,7 @@ fn cost_per_export() -> i32 {
 fn kredit_habis() -> ApiError {
     ApiError(
         StatusCode::PAYMENT_REQUIRED,
-        "Kredit Anda habis. Silakan top-up terlebih dahulu untuk mengakses peta.".into(),
+        "Kredit Anda habis. Silakan beli kredit lewat admin terlebih dahulu untuk mengakses peta.".into(),
     )
 }
 
@@ -604,202 +583,52 @@ pub async fn charge_peta(_pool: &PgPool, user: &DbUser, _kabupaten: &str) -> Res
     cek_punya_kredit(user)
 }
 
-// ===================== TOP-UP (USER) =====================
-fn sniff_mime(b: &[u8]) -> Option<&'static str> {
-    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
-        Some("image/png")
-    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
-pub async fn topup_create(
-    State(pool): State<PgPool>,
-    Extension(user): Extension<DbUser>,
-    mut mp: Multipart,
-) -> Result<Json<Value>, ApiError> {
-    let mut nominal: i64 = 0;
-    let mut catatan = String::new();
-    let mut bukti: Option<Vec<u8>> = None;
-
-    while let Some(field) = mp.next_field().await.map_err(|_| ApiError::bad("Form tidak valid atau file terlalu besar."))? {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "nominal" => {
-                let t = field.text().await.map_err(|_| ApiError::bad("Nominal tidak valid."))?;
-                nominal = t.trim().parse().map_err(|_| ApiError::bad("Nominal harus berupa angka."))?;
-            }
-            "catatan" => {
-                let t = field.text().await.map_err(|_| ApiError::bad("Catatan tidak valid."))?;
-                catatan = t.chars().take(300).collect();
-            }
-            "bukti" => {
-                let b = field.bytes().await.map_err(|_| ApiError::bad("Gagal membaca file bukti."))?;
-                bukti = Some(b.to_vec());
-            }
-            _ => {}
-        }
-    }
-
-    if nominal <= 0 || nominal > 100_000_000 {
-        return Err(ApiError::bad("Nominal pembayaran tidak valid."));
-    }
-    let bukti = bukti.ok_or_else(|| ApiError::bad("Bukti pembayaran wajib diunggah."))?;
-    if bukti.len() > 3 * 1024 * 1024 {
-        return Err(ApiError::bad("Ukuran bukti maksimal 3 MB."));
-    }
-    let mime = sniff_mime(&bukti).ok_or_else(|| ApiError::bad("Bukti harus berupa gambar PNG, JPG, atau WEBP."))?;
-
-    let (pending,): (i64,) =
-        sqlx::query_as("SELECT count(*) FROM topup_requests WHERE user_id = $1 AND status = 'pending'")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await?;
-    if pending >= 3 {
-        return Err(ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Masih ada 3 permintaan yang menunggu verifikasi admin.".into(),
-        ));
-    }
-
-    sqlx::query(
-        "INSERT INTO topup_requests (user_id, nominal, catatan, bukti, bukti_mime) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(user.id)
-    .bind(nominal)
-    .bind(&catatan)
-    .bind(&bukti)
-    .bind(mime)
-    .execute(&pool)
-    .await?;
-
-    Ok(Json(json!({ "success": true, "message": "Bukti terkirim. Admin akan memverifikasi dan menambahkan kredit Anda." })))
-}
-
-pub async fn topup_list_mine(
-    State(pool): State<PgPool>,
-    Extension(user): Extension<DbUser>,
-) -> Result<Json<Vec<TopupOut>>, ApiError> {
-    let q = format!("{TOPUP_SELECT} WHERE t.user_id = $1 ORDER BY t.id DESC LIMIT 20");
-    let rows = sqlx::query_as::<_, TopupOut>(&q).bind(user.id).fetch_all(&pool).await?;
-    Ok(Json(rows))
-}
-
 // ===================== ADMIN =====================
-pub async fn admin_topup_list(
+/// Cari akun user (nama atau email) agar admin memilih akun dari database, bukan mengetik email manual.
+/// Tanpa kata kunci: tampilkan 10 akun terbaru. Hanya akun yang emailnya sudah terverifikasi.
+pub async fn admin_users_search(
     State(pool): State<PgPool>,
-    Extension(user): Extension<DbUser>,
+    Extension(admin): Extension<DbUser>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<TopupOut>>, ApiError> {
-    require_admin(&user)?;
-    let status = params.get("status").cloned().unwrap_or_else(|| "pending".into());
-    let q = format!("{TOPUP_SELECT} WHERE ($1 = 'all' OR t.status = $1) ORDER BY t.id DESC LIMIT 100");
-    let rows = sqlx::query_as::<_, TopupOut>(&q).bind(status).fetch_all(&pool).await?;
-    Ok(Json(rows))
-}
-
-pub async fn admin_bukti(
-    State(pool): State<PgPool>,
-    Extension(user): Extension<DbUser>,
-    Path(id): Path<i64>,
-) -> Result<Response, ApiError> {
-    require_admin(&user)?;
-    let row: Option<(Vec<u8>, String)> =
-        sqlx::query_as("SELECT bukti, bukti_mime FROM topup_requests WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?;
-    let (bytes, mime) = row.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Bukti tidak ditemukan.".into()))?;
-    Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
-}
-
-#[derive(Deserialize)]
-pub struct ApproveReq {
-    kredit: i32,
-}
-
-pub async fn admin_approve(
-    State(pool): State<PgPool>,
-    Extension(admin): Extension<DbUser>,
-    Path(id): Path<i64>,
-    Json(req): Json<ApproveReq>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Vec<UserOut>>, ApiError> {
     require_admin(&admin)?;
-    if req.kredit < 1 || req.kredit > 100_000 {
-        return Err(ApiError::bad("Jumlah kredit harus 1 - 100.000."));
-    }
-    let mut tx = pool.begin().await?;
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT user_id FROM topup_requests WHERE id = $1 AND status = 'pending' FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let (uid,) = row.ok_or_else(|| ApiError(StatusCode::CONFLICT, "Permintaan tidak ditemukan atau sudah diproses.".into()))?;
+    let q: String = params.get("q").map(|s| s.trim()).unwrap_or("").chars().take(80).collect();
 
-    sqlx::query(
-        "UPDATE topup_requests SET status = 'approved', kredit_diberikan = $1, reviewed_by = $2, reviewed_at = now() WHERE id = $3",
-    )
-    .bind(req.kredit)
-    .bind(admin.id)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE users SET kredit = kredit + $1 WHERE id = $2")
-        .bind(req.kredit)
-        .bind(uid)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO kredit_log (user_id, delta, alasan, ref) VALUES ($1, $2, 'topup', $3)")
-        .bind(uid)
-        .bind(req.kredit)
-        .bind(format!("topup#{id}"))
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(json!({ "success": true })))
-}
+    let rows: Vec<(i64, String, String, String, i32)> = if q.is_empty() {
+        sqlx::query_as(
+            "SELECT id, email, nama, role, kredit FROM users
+             WHERE email_verified = true ORDER BY id DESC LIMIT 10",
+        )
+        .fetch_all(&pool)
+        .await?
+    } else {
+        // Karakter khusus LIKE di-escape supaya "%" atau "_" dicari apa adanya
+        let esc = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        sqlx::query_as(
+            "SELECT id, email, nama, role, kredit FROM users
+             WHERE email_verified = true AND (email ILIKE $1 OR nama ILIKE $1)
+             ORDER BY nama ASC, id ASC LIMIT 10",
+        )
+        .bind(format!("%{esc}%"))
+        .fetch_all(&pool)
+        .await?
+    };
 
-#[derive(Deserialize)]
-pub struct RejectReq {
-    alasan: Option<String>,
-}
-
-pub async fn admin_reject(
-    State(pool): State<PgPool>,
-    Extension(admin): Extension<DbUser>,
-    Path(id): Path<i64>,
-    Json(req): Json<RejectReq>,
-) -> Result<Json<Value>, ApiError> {
-    require_admin(&admin)?;
-    let alasan: String = req.alasan.unwrap_or_default().chars().take(200).collect();
-    let r = sqlx::query(
-        "UPDATE topup_requests SET status = 'rejected', alasan_admin = $1, reviewed_by = $2, reviewed_at = now()
-         WHERE id = $3 AND status = 'pending'",
-    )
-    .bind(alasan)
-    .bind(admin.id)
-    .bind(id)
-    .execute(&pool)
-    .await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::CONFLICT, "Permintaan tidak ditemukan atau sudah diproses.".into()));
-    }
-    Ok(Json(json!({ "success": true })))
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, email, nama, role, kredit)| UserOut { id, email, nama, role, kredit })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
 pub struct AddKreditReq {
-    email: String,
+    user_id: i64,
     jumlah: i32,
     alasan: Option<String>,
 }
 
-/// Tambah/kurangi kredit manual berdasarkan email (tanpa bukti, mis. koreksi atau bonus).
+/// Tambah/kurangi kredit berdasarkan id akun yang dipilih admin lewat pencarian (mis. setelah pembayaran lewat WhatsApp).
 pub async fn admin_add_kredit(
     State(pool): State<PgPool>,
     Extension(admin): Extension<DbUser>,
@@ -810,14 +639,15 @@ pub async fn admin_add_kredit(
         return Err(ApiError::bad("Jumlah tidak valid."));
     }
     let mut tx = pool.begin().await?;
-    let row: Option<(i64, i32)> = sqlx::query_as(
-        "UPDATE users SET kredit = kredit + $1 WHERE email = $2 AND kredit + $1 >= 0 RETURNING id, kredit",
+    let row: Option<(i64, String, String, i32)> = sqlx::query_as(
+        "UPDATE users SET kredit = kredit + $1 WHERE id = $2 AND kredit + $1 >= 0 RETURNING id, email, nama, kredit",
     )
     .bind(req.jumlah)
-    .bind(req.email.trim().to_lowercase())
+    .bind(req.user_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let (uid, saldo) = row.ok_or_else(|| ApiError::bad("User tidak ditemukan atau saldo akan menjadi negatif."))?;
+    let (uid, email, nama, saldo) =
+        row.ok_or_else(|| ApiError::bad("User tidak ditemukan atau saldo akan menjadi negatif."))?;
     let alasan: String = req.alasan.unwrap_or_else(|| "manual".into()).chars().take(100).collect();
     sqlx::query("INSERT INTO kredit_log (user_id, delta, alasan, ref) VALUES ($1, $2, $3, $4)")
         .bind(uid)
@@ -827,7 +657,7 @@ pub async fn admin_add_kredit(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(json!({ "success": true, "saldo": saldo })))
+    Ok(Json(json!({ "success": true, "saldo": saldo, "email": email, "nama": nama })))
 }
 
 #[derive(Deserialize)]
@@ -859,7 +689,7 @@ pub async fn cek_ekspor(
     let (sisa,) = row.ok_or_else(|| {
         ApiError(
             StatusCode::PAYMENT_REQUIRED,
-            format!("Kredit tidak cukup. Ekspor membutuhkan {biaya} kredit, silakan top-up terlebih dahulu."),
+            format!("Kredit tidak cukup. Ekspor membutuhkan {biaya} kredit, silakan beli kredit lewat admin terlebih dahulu."),
         )
     })?;
 

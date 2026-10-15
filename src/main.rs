@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{Query, State},
     http::{header, StatusCode},
     middleware,
     routing::{get, post},
@@ -166,7 +166,7 @@ async fn main() {
         .await
         .expect("Gagal terhubung ke database. Periksa DATABASE_URL (termasuk ?sslmode=require untuk Aiven).");
 
-    // Membuat tabel users, topup_requests, kredit_log, peta_akses bila belum ada
+    // Membuat tabel users, kredit_log, peta_akses (dan topup_requests lama) bila belum ada
     auth::ensure_schema(&pool)
         .await
         .expect("Gagal membuat tabel autentikasi.");
@@ -192,17 +192,8 @@ async fn main() {
             get(osm_cache_get_handler).post(osm_cache_post_handler),
         )
         .route("/api/gee-tiles", get(gee::gee_tiles))
-        .route(
-            "/api/topup",
-            get(auth::topup_list_mine)
-                .post(auth::topup_create)
-                .layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
-        )
         // ---- Admin (dicek lagi di dalam handler) ----
-        .route("/api/admin/topup", get(auth::admin_topup_list))
-        .route("/api/admin/topup/:id/bukti", get(auth::admin_bukti))
-        .route("/api/admin/topup/:id/approve", post(auth::admin_approve))
-        .route("/api/admin/topup/:id/reject", post(auth::admin_reject))
+        .route("/api/admin/users", get(auth::admin_users_search))
         .route("/api/admin/kredit", post(auth::admin_add_kredit))
         .route_layer(middleware::from_fn_with_state(pool.clone(), auth::require_auth));
 
