@@ -10,6 +10,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 
 mod auth;
@@ -160,8 +161,16 @@ async fn main() {
     // Gagal cepat bila JWT_SECRET belum diset
     auth::jwt_secret();
 
+    // Dikonfigurasi untuk serverless (Vercel): instance dibekukan di antara request, jadi koneksi yang
+    // menganggur cepat basi. Pool kecil + koneksi dibuang lebih cepat + gagal cepat (bukan menunggu 30 dtk)
+    // supaya tidak menghabiskan batas koneksi Aiven dan tidak menggantung.
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(2)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_secs(8))
+        .idle_timeout(Duration::from_secs(15))
+        .max_lifetime(Duration::from_secs(240))
+        .test_before_acquire(true)
         .connect(&database_url)
         .await
         .expect("Gagal terhubung ke database. Periksa DATABASE_URL (termasuk ?sslmode=require untuk Aiven).");

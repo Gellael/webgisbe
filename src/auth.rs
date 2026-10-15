@@ -608,9 +608,8 @@ pub struct ForgotReq {
     email: String,
 }
 
-/// Minta kode reset. Jawaban SELALU sama (email terdaftar atau tidak, kena jeda atau tidak, SMTP gagal atau tidak)
-/// supaya endpoint ini tidak bisa dipakai menebak email yang terdaftar. Pengiriman dijalankan di background
-/// agar waktu respons juga tidak membedakan keduanya.
+/// Minta kode reset. Jawaban SELALU sama (email terdaftar atau tidak, kena jeda atau tidak, SMTP gagal atau tidak).
+/// Hasil sebenarnya (terkirim / ditolak jeda / SMTP gagal) hanya dicatat di log server.
 pub async fn forgot_password(
     State(pool): State<PgPool>,
     Json(req): Json<ForgotReq>,
@@ -624,11 +623,13 @@ pub async fn forgot_password(
         .fetch_optional(&pool)
         .await?;
         if let Some(u) = user {
-            tokio::spawn(async move {
-                if let Err(ApiError(status, msg)) = issue_reset_code(&pool, &u).await {
-                    eprintln!("Reset password {}: {} {}", u.email, status, msg);
-                }
-            });
+            // Dijalankan SEBELUM membalas (bukan tokio::spawn) supaya pengiriman email tidak terputus
+            // di hosting yang membatasi CPU setelah respons terkirim, dan supaya jeda 60 detik di server
+            // sudah tercatat sebelum hitung mundur di browser dimulai.
+            match issue_reset_code(&pool, &u).await {
+                Ok(()) => println!("Kode reset terkirim ke {}", u.email),
+                Err(ApiError(status, msg)) => eprintln!("Reset password {}: {} {}", u.email, status, msg),
+            }
         }
     }
     Ok(Json(json!({ "success": true })))
