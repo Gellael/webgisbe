@@ -182,7 +182,9 @@ async fn main() {
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify", post(auth::verify_email))   
-        .route("/api/auth/resend", post(auth::resend_code));
+        .route("/api/auth/resend", post(auth::resend_code))
+        .route("/api/auth/forgot", post(auth::forgot_password))
+        .route("/api/auth/reset", post(auth::reset_password));
     let protected = Router::new()
         .route("/api/me", get(auth::me))
         .route("/api/get-desa", get(get_desa_handler))

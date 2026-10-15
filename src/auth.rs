@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS email_verifications (
     last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Kode reset kata sandi (dipisah dari email_verifications supaya kode verifikasi tidak bisa dipakai untuk reset)
+CREATE TABLE IF NOT EXISTS password_resets (
+    user_id      BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code_hash    TEXT NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS topup_requests (
     id               BIGSERIAL PRIMARY KEY,
     user_id          BIGINT NOT NULL REFERENCES users(id),
@@ -267,7 +276,7 @@ const EMAIL_HTML: &str = r##"<!DOCTYPE html>
     <tr><td style="padding:32px 28px 8px 28px;color:#0f172a;">
       <div style="font-size:20px;font-weight:700;margin-bottom:12px;">Halo, {{NAMA}} &#128075;</div>
       <div style="font-size:15px;line-height:1.6;color:#334155;">
-        Terima kasih sudah mendaftar di Petakilat. Masukkan kode berikut untuk memverifikasi email Anda:
+        {{INTRO}}
       </div>
     </td></tr>
 
@@ -286,7 +295,7 @@ const EMAIL_HTML: &str = r##"<!DOCTYPE html>
     <!-- Footer -->
     <tr><td bgcolor="#f8fafc" style="background-color:#f8fafc;padding:18px 28px;border-top:1px solid #e2e8f0;">
       <div style="font-size:12px;line-height:1.6;color:#94a3b8;text-align:center;">
-        Tidak merasa mendaftar di Petakilat? Abaikan saja email ini.<br>
+        {{FOOTER}}<br>
         &copy; Petakilat &#9889;
       </div>
     </td></tr>
@@ -299,7 +308,7 @@ const EMAIL_HTML: &str = r##"<!DOCTYPE html>
 </html>"##;
 
 /// Kirim kode via SMTP. Env: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM (opsional), SMTP_PORT (opsional, default 587).
-async fn send_code_email(to: &str, nama: &str, code: &str) -> Result<(), String> {
+async fn send_code_email(to: &str, nama: &str, code: &str, reset: bool) -> Result<(), String> {
     use lettre::{
         message::{Mailbox, MultiPart},
         transport::smtp::authentication::Credentials,
@@ -311,20 +320,36 @@ async fn send_code_email(to: &str, nama: &str, code: &str) -> Result<(), String>
     let from = env::var("SMTP_FROM").unwrap_or_else(|_| user.clone());
     let port: u16 = env::var("SMTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(587);
 
+    // Teks berbeda untuk verifikasi email (daftar) dan reset kata sandi (lupa password)
+    let (intro, footer, kind) = if reset {
+        (
+            "Kami menerima permintaan untuk mengatur ulang kata sandi akun Petakilat Anda. Masukkan kode berikut untuk membuat kata sandi baru:",
+            "Tidak merasa meminta reset kata sandi? Abaikan saja email ini, kata sandi Anda tidak berubah.",
+            "reset kata sandi",
+        )
+    } else {
+        (
+            "Terima kasih sudah mendaftar di Petakilat. Masukkan kode berikut untuk memverifikasi email Anda:",
+            "Tidak merasa mendaftar di Petakilat? Abaikan saja email ini.",
+            "verifikasi",
+        )
+    };
     let plain = format!(
-        "Halo {nama},\n\nKode verifikasi email Anda di Petakilat: {code}\n\n\
+        "Halo {nama},\n\n{intro}\n\nKode {kind} Anda: {code}\n\n\
          Kode berlaku {CODE_TTL_MIN} menit. Jangan bagikan kode ini kepada siapa pun.\n\
-         Jika Anda tidak merasa mendaftar di Petakilat, abaikan email ini.\n"
+         {footer}\n"
     );
     let html = EMAIL_HTML
         .replace("{{NAMA}}", &html_escape(nama))
+        .replace("{{INTRO}}", intro)
+        .replace("{{FOOTER}}", footer)
         .replace("{{KODE}}", code)
         .replace("{{TTL}}", &CODE_TTL_MIN.to_string());
 
     let msg = Message::builder()
         .from(from.parse::<Mailbox>().map_err(|e| e.to_string())?)
         .to(to.parse::<Mailbox>().map_err(|e| e.to_string())?)
-        .subject(format!("⚡ {code} adalah kode verifikasi Petakilat Anda"))
+        .subject(format!("⚡ {code} adalah kode {kind} Petakilat Anda"))
         .multipart(MultiPart::alternative_plain_html(plain, html))
         .map_err(|e| e.to_string())?;
 
@@ -364,7 +389,7 @@ async fn issue_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
             "Tunggu sekitar 1 menit sebelum meminta kode baru.".into(),
         ));
     }
-    send_code_email(&user.email, &user.nama, &code).await.map_err(|e| {
+    send_code_email(&user.email, &user.nama, &code, false).await.map_err(|e| {
         eprintln!("Gagal kirim email verifikasi ke {}: {e}", user.email);
         ApiError(StatusCode::BAD_GATEWAY, "Gagal mengirim email verifikasi. Coba lagi nanti.".into())
     })
@@ -540,6 +565,140 @@ pub async fn resend_code(
         issue_code(&pool, &u).await?;
     }
     Ok(Json(json!({ "success": true })))
+}
+
+// ===================== LUPA KATA SANDI =====================
+/// Kode reset diikat ke user_id + JWT_SECRET + kata "reset", jadi tidak sama dengan kode verifikasi email.
+fn hash_reset_code(user_id: i64, code: &str) -> String {
+    let input = format!("reset:{user_id}:{code}:{}", jwt_secret());
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+/// Buat kode reset baru lalu kirim ke email. Ditolak (429) jika masih dalam masa jeda.
+async fn issue_reset_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
+    let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
+    let r = sqlx::query(
+        "INSERT INTO password_resets (user_id, code_hash, expires_at, attempts, last_sent_at)
+         VALUES ($1, $2, now() + make_interval(mins => $3), 0, now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at,
+               attempts = 0, last_sent_at = now()
+           WHERE password_resets.last_sent_at < now() - make_interval(secs => $4)",
+    )
+    .bind(user.id)
+    .bind(hash_reset_code(user.id, &code))
+    .bind(CODE_TTL_MIN)
+    .bind(RESEND_COOLDOWN_SEC)
+    .execute(pool)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Tunggu sekitar 1 menit sebelum meminta kode baru.".into(),
+        ));
+    }
+    send_code_email(&user.email, &user.nama, &code, true).await.map_err(|e| {
+        eprintln!("Gagal kirim email reset ke {}: {e}", user.email);
+        ApiError(StatusCode::BAD_GATEWAY, "Gagal mengirim email. Coba lagi nanti.".into())
+    })
+}
+
+#[derive(Deserialize)]
+pub struct ForgotReq {
+    email: String,
+}
+
+/// Minta kode reset. Jawaban SELALU sama (email terdaftar atau tidak, kena jeda atau tidak, SMTP gagal atau tidak)
+/// supaya endpoint ini tidak bisa dipakai menebak email yang terdaftar. Pengiriman dijalankan di background
+/// agar waktu respons juga tidak membedakan keduanya.
+pub async fn forgot_password(
+    State(pool): State<PgPool>,
+    Json(req): Json<ForgotReq>,
+) -> Result<Json<Value>, ApiError> {
+    let email = req.email.trim().to_lowercase();
+    if email.len() <= 120 {
+        let user: Option<DbUser> = sqlx::query_as(
+            "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE email = $1",
+        )
+        .bind(&email)
+        .fetch_optional(&pool)
+        .await?;
+        if let Some(u) = user {
+            tokio::spawn(async move {
+                if let Err(ApiError(status, msg)) = issue_reset_code(&pool, &u).await {
+                    eprintln!("Reset password {}: {} {}", u.email, status, msg);
+                }
+            });
+        }
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ResetReq {
+    email: String,
+    code: String,
+    password: String,
+}
+
+/// Atur kata sandi baru memakai kode dari email. Jika berhasil, user langsung masuk (token dikembalikan).
+/// Karena kode terbukti sampai ke email tersebut, email otomatis ditandai terverifikasi.
+pub async fn reset_password(
+    State(pool): State<PgPool>,
+    Json(req): Json<ResetReq>,
+) -> Result<Json<AuthResp>, ApiError> {
+    let email = req.email.trim().to_lowercase();
+    // Validasi kata sandi di awal supaya salah ketik tidak menghabiskan jatah percobaan kode
+    if req.password.len() < 8 || req.password.len() > 128 {
+        return Err(ApiError::bad("Kata sandi 8-128 karakter."));
+    }
+    let bad = || ApiError::bad("Kode salah.");
+    let user: Option<DbUser> = sqlx::query_as(
+        "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await?;
+    let user = user.ok_or_else(bad)?;
+
+    // Setiap percobaan dihitung secara atomik; kode mati setelah MAX_ATTEMPTS salah atau kedaluwarsa.
+    let row: Option<(String,)> = sqlx::query_as(
+        "UPDATE password_resets SET attempts = attempts + 1
+         WHERE user_id = $1 AND attempts < $2 AND expires_at > now()
+         RETURNING code_hash",
+    )
+    .bind(user.id)
+    .bind(MAX_ATTEMPTS)
+    .fetch_optional(&pool)
+    .await?;
+    let (stored,) = row.ok_or_else(|| {
+        ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Kode kedaluwarsa atau terlalu banyak percobaan. Minta kode baru.".into(),
+        )
+    })?;
+    if stored != hash_reset_code(user.id, req.code.trim()) {
+        return Err(bad());
+    }
+
+    let hash = hash_pw(req.password).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE users SET password_hash = $1, email_verified = true WHERE id = $2")
+        .bind(&hash)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM password_resets WHERE user_id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM email_verifications WHERE user_id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }))
 }
 
 pub async fn me(Extension(user): Extension<DbUser>) -> Json<UserOut> {
