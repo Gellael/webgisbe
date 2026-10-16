@@ -7,60 +7,66 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 
 mod auth;
 mod gee;
 
+// ===================== DATA DESA DARI BIG (tanpa database) =====================
+// Batas desa/kelurahan tidak lagi disimpan di Aiven. Data diambil langsung dari layanan resmi BIG
+// setiap kali dibutuhkan. Tabel `batas_wilayah` tidak dipakai lagi.
+const BIG_LAYER_DESA: &str =
+    "https://geoservices.big.go.id/rbi/rest/services/BATASWILAYAH/Administrasi_AR_KelDesa_10K/MapServer/0/query";
+
+// Daftar provinsi -> kabupaten untuk dropdown. Dibuat SEKALI dari file .dbf lokal
+// (jalankan tools/buat_wilayah.py), lalu disimpan di src/wilayah.json dan ikut ter-compile.
+// Layer BIG tidak mendukung DISTINCT/paginasi, jadi daftar ini tidak bisa ditarik langsung darinya.
+const WILAYAH_JSON: &str = include_str!("wilayah.json");
+
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(25))
+            .build()
+            .expect("Gagal membuat HTTP client")
+    })
+}
+
+fn wilayah() -> &'static BTreeMap<String, Vec<String>> {
+    static W: OnceLock<BTreeMap<String, Vec<String>>> = OnceLock::new();
+    W.get_or_init(|| {
+        serde_json::from_str(WILAYAH_JSON).expect("src/wilayah.json tidak valid")
+    })
+}
+
+fn big_gagal() -> auth::ApiError {
+    auth::ApiError(
+        StatusCode::BAD_GATEWAY,
+        "Layanan data batas wilayah (BIG) sedang tidak dapat dihubungi. Coba lagi beberapa saat.".into(),
+    )
+}
+
+// Tanpa parameter  -> daftar provinsi
+// ?provinsi=XXXX   -> daftar kabupaten/kota di provinsi itu
 async fn get_wilayah_handler(
-    State(pool): State<PgPool>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    if let Some(prov) = params.get("provinsi") {
-        let query = r#"
-            SELECT DISTINCT "WADMKK" AS kabupaten
-            FROM batas_wilayah
-            WHERE "WADMPR" = $1
-            AND "WADMKK" IS NOT NULL
-            AND "WADMKK" != ''
-            ORDER BY kabupaten ASC;
-        "#;
-
-        let rows: Result<Vec<(String,)>, _> = sqlx::query_as(query)
-            .bind(prov)
-            .fetch_all(&pool)
-            .await;
-
-        match rows {
-            Ok(data) => Json(serde_json::json!(
-                data.into_iter().map(|r| r.0).collect::<Vec<String>>()
-            )),
-            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-        }
-    } else {
-        let query = r#"
-            SELECT DISTINCT "WADMPR" AS provinsi
-            FROM batas_wilayah
-            WHERE "WADMPR" IS NOT NULL AND "WADMPR" != ''
-            ORDER BY provinsi ASC;
-        "#;
-
-        let rows: Result<Vec<(String,)>, _> = sqlx::query_as(query).fetch_all(&pool).await;
-
-        match rows {
-            Ok(data) => Json(serde_json::json!(
-                data.into_iter().map(|r| r.0).collect::<Vec<String>>()
-            )),
-            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-        }
+    let data = wilayah();
+    match params.get("provinsi") {
+        Some(prov) => Json(serde_json::json!(data.get(prov).cloned().unwrap_or_default())),
+        None => Json(serde_json::json!(data.keys().collect::<Vec<_>>())),
     }
 }
 
-// PROTEKSI: wajib login + memotong kredit (sekali per kabupaten per 24 jam)
+// PROTEKSI: wajib login + memiliki kredit (dicek di auth::charge_peta).
+// Mengembalikan GeoJSON FeatureCollection seluruh desa dalam satu kabupaten (bentuk sama seperti sebelumnya).
 async fn get_desa_handler(
     State(pool): State<PgPool>,
     Extension(user): Extension<auth::DbUser>,
@@ -70,33 +76,61 @@ async fn get_desa_handler(
         auth::ApiError(StatusCode::BAD_REQUEST, "Pilih kabupaten terlebih dahulu.".into())
     })?;
 
-    let query = r#"
-        SELECT jsonb_build_object(
-            'type',     'FeatureCollection',
-            'features', COALESCE(jsonb_agg(features.feature), '[]'::jsonb)
-        ) AS geojson
-        FROM (
-          SELECT jsonb_build_object(
-            'type',       'Feature',
-            'geometry',   ST_AsGeoJSON(geom)::jsonb,
-            'properties', to_jsonb(inputs) - 'geom'
-          ) AS feature
-          FROM (
-            SELECT * FROM batas_wilayah
-            WHERE "WADMKK" = $1
-          ) inputs
-        ) features;
-    "#;
+    if kabupaten.is_empty() || kabupaten.chars().count() > 100 {
+        return Err(auth::ApiError(StatusCode::BAD_REQUEST, "Nama kabupaten tidak valid.".into()));
+    }
 
-    let row: (sqlx::types::Json<serde_json::Value>,) = sqlx::query_as(query)
-        .bind(kabupaten)
-        .fetch_one(&pool)
-        .await?;
+    // Tanda kutip tunggal digandakan agar nilai tidak bisa merusak klausa WHERE.
+    let where_clause = format!("WADMKK = '{}'", kabupaten.replace('\'', "''"));
 
-    // Kredit dipotong HANYA setelah data berhasil diambil
+    let query = [
+        ("where", where_clause.as_str()),
+        ("outFields", "*"),
+        ("outSR", "4326"),
+        ("returnGeometry", "true"),
+        ("returnZ", "false"),
+        ("returnM", "false"),
+        ("geometryPrecision", "6"),
+        ("f", "geojson"),
+    ];
+
+    let resp = http_client()
+        .get(BIG_LAYER_DESA)
+        .query(&query)
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("BIG request gagal: {e}");
+            big_gagal()
+        })?;
+
+    if !resp.status().is_success() {
+        eprintln!("BIG membalas status {}", resp.status());
+        return Err(big_gagal());
+    }
+
+    let geojson: serde_json::Value = resp.json().await.map_err(|e| {
+        eprintln!("Balasan BIG bukan JSON valid: {e}");
+        big_gagal()
+    })?;
+
+    // ArcGIS kadang membalas HTTP 200 dengan {"error": {...}}
+    let punya_fitur = geojson.get("features").map_or(false, |f| f.is_array());
+    if geojson.get("error").is_some() || !punya_fitur {
+        eprintln!("Balasan BIG tidak berisi features: {}", geojson.get("error").unwrap_or(&serde_json::Value::Null));
+        return Err(big_gagal());
+    }
+
+    // Batas per permintaan layer ini 4000 fitur dan tanpa paginasi. Kabupaten terbesar jauh di bawah itu,
+    // tetapi bila suatu saat terlampaui, hasil terpotong dan perlu ditangani.
+    if geojson.get("exceededTransferLimit").and_then(|v| v.as_bool()).unwrap_or(false) {
+        eprintln!("PERINGATAN: hasil BIG untuk '{}' terpotong (exceededTransferLimit)", kabupaten);
+    }
+
+    // Pengecekan kredit dilakukan SETELAH data berhasil diambil (seperti sebelumnya).
     auth::charge_peta(&pool, &user, kabupaten).await?;
 
-    Ok(Json(row.0 .0))
+    Ok(Json(geojson))
 }
 
 #[derive(Deserialize)]
