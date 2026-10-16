@@ -2,7 +2,8 @@
 //!
 //! Dipakai oleh `get_desa_handler` di main.rs. Modul ini berdiri sendiri dan tidak memakai fungsi di gee.rs.
 //! Konfigurasi lewat .env (semua opsional, ada nilai bawaan):
-//!   GEE_KEY_FILE     path file kunci service account      (bawaan: gee-key.json)
+//!   GEE_KEY_JSON / GEE_SERVICE_ACCOUNT_JSON  isi JSON kunci (untuk Vercel)
+//!   GEE_KEY_FILE     path file kunci service account, hanya bila env di atas kosong (bawaan: gee-key.json)
 //!   GEE_PROJECT      ID project Google Cloud               (bawaan: project-gis-494114)
 //!   GEE_ASSET_DESA   ID asset tabel desa                   (bawaan: projects/<GEE_PROJECT>/assets/batas_desa)
 use gcp_auth::{CustomServiceAccount, TokenProvider};
@@ -27,12 +28,39 @@ fn asset_desa() -> String {
 
 async fn akun() -> anyhow::Result<&'static CustomServiceAccount> {
     AKUN.get_or_try_init(|| async {
-        let path = env::var("GEE_KEY_FILE").unwrap_or_else(|_| "gee-key.json".to_string());
-        let akun = CustomServiceAccount::from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Gagal membaca kunci GEE '{path}': {e}"))?;
+        // Urutan: GEE_KEY_JSON -> GEE_SERVICE_ACCOUNT_JSON (isi JSON di env, untuk Vercel)
+        // -> file GEE_KEY_FILE (untuk lokal).
+        let isi = env::var("GEE_KEY_JSON")
+            .or_else(|_| env::var("GEE_SERVICE_ACCOUNT_JSON"))
+            .ok();
+
+        let akun = match isi {
+            Some(j) => CustomServiceAccount::from_json(&j)
+                .map_err(|e| anyhow::anyhow!("Kunci GEE dari env tidak valid: {e}"))?,
+            None => {
+                let path = env::var("GEE_KEY_FILE").unwrap_or_else(|_| "gee-key.json".to_string());
+                CustomServiceAccount::from_file(&path)
+                    .map_err(|e| anyhow::anyhow!("Gagal membaca kunci GEE '{path}': {e}"))?
+            }
+        };
         Ok::<_, anyhow::Error>(akun)
     })
     .await
+}
+
+/// Membulatkan semua angka koordinat ke 5 desimal (~1 m) agar respons lebih kecil.
+fn bulatkan(v: &mut Value) {
+    if let Some(a) = v.as_array_mut() {
+        for x in a {
+            bulatkan(x);
+        }
+        return;
+    }
+    if let Some(f) = v.as_f64() {
+        if let Some(n) = serde_json::Number::from_f64((f * 1e5).round() / 1e5) {
+            *v = Value::Number(n);
+        }
+    }
 }
 
 /// Ekspresi Earth Engine untuk: ee.FeatureCollection(ASET).filter(ee.Filter.eq('WADMKK', kabupaten))
@@ -108,6 +136,12 @@ pub async fn ambil_desa(client: &reqwest::Client, kabupaten: &str) -> anyhow::Re
             .map(String::from);
         if page_token.is_none() {
             break;
+        }
+    }
+
+    for f in fitur.iter_mut() {
+        if let Some(c) = f.pointer_mut("/geometry/coordinates") {
+            bulatkan(c);
         }
     }
 
