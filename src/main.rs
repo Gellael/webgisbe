@@ -15,6 +15,7 @@ use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 
 mod auth;
+mod desa_gee;
 mod gee;
 
 // ===================== DATA DESA DARI BIG (tanpa database) =====================
@@ -65,21 +66,8 @@ async fn get_wilayah_handler(
     }
 }
 
-// PROTEKSI: wajib login + memiliki kredit (dicek di auth::charge_peta).
-// Mengembalikan GeoJSON FeatureCollection seluruh desa dalam satu kabupaten (bentuk sama seperti sebelumnya).
-async fn get_desa_handler(
-    State(pool): State<PgPool>,
-    Extension(user): Extension<auth::DbUser>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, auth::ApiError> {
-    let kabupaten = params.get("kabupaten").ok_or_else(|| {
-        auth::ApiError(StatusCode::BAD_REQUEST, "Pilih kabupaten terlebih dahulu.".into())
-    })?;
-
-    if kabupaten.is_empty() || kabupaten.chars().count() > 100 {
-        return Err(auth::ApiError(StatusCode::BAD_REQUEST, "Nama kabupaten tidak valid.".into()));
-    }
-
+// Mengambil desa dari layanan BIG. Mengembalikan Err(pesan) bila gagal.
+async fn ambil_desa_big(kabupaten: &str) -> Result<serde_json::Value, String> {
     // Tanda kutip tunggal digandakan agar nilai tidak bisa merusak klausa WHERE.
     let where_clause = format!("WADMKK = '{}'", kabupaten.replace('\'', "''"));
 
@@ -99,33 +87,95 @@ async fn get_desa_handler(
         .query(&query)
         .send()
         .await
-        .map_err(|e| {
-            eprintln!("BIG request gagal: {e}");
-            big_gagal()
-        })?;
+        .map_err(|e| format!("request gagal: {e}"))?;
 
     if !resp.status().is_success() {
-        eprintln!("BIG membalas status {}", resp.status());
-        return Err(big_gagal());
+        return Err(format!("status {}", resp.status()));
     }
 
-    let geojson: serde_json::Value = resp.json().await.map_err(|e| {
-        eprintln!("Balasan BIG bukan JSON valid: {e}");
-        big_gagal()
-    })?;
+    let geojson: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("balasan bukan JSON valid: {e}"))?;
 
     // ArcGIS kadang membalas HTTP 200 dengan {"error": {...}}
     let punya_fitur = geojson.get("features").map_or(false, |f| f.is_array());
     if geojson.get("error").is_some() || !punya_fitur {
-        eprintln!("Balasan BIG tidak berisi features: {}", geojson.get("error").unwrap_or(&serde_json::Value::Null));
-        return Err(big_gagal());
+        return Err(format!(
+            "balasan tidak berisi features: {}",
+            geojson.get("error").unwrap_or(&serde_json::Value::Null)
+        ));
     }
 
-    // Batas per permintaan layer ini 4000 fitur dan tanpa paginasi. Kabupaten terbesar jauh di bawah itu,
-    // tetapi bila suatu saat terlampaui, hasil terpotong dan perlu ditangani.
+    // Batas 4000 fitur per permintaan dan tanpa paginasi pada layer ini.
     if geojson.get("exceededTransferLimit").and_then(|v| v.as_bool()).unwrap_or(false) {
         eprintln!("PERINGATAN: hasil BIG untuk '{}' terpotong (exceededTransferLimit)", kabupaten);
     }
+
+    Ok(geojson)
+}
+
+fn jumlah_fitur(geojson: &serde_json::Value) -> usize {
+    geojson
+        .get("features")
+        .and_then(|f| f.as_array())
+        .map_or(0, |a| a.len())
+}
+
+// Urutan sumber data desa. Atur lewat .env: DESA_SUMBER_UTAMA=big (bawaan) atau gee.
+// Sumber pertama dicoba lebih dulu; bila gagal ATAU hasilnya kosong, dicoba sumber kedua.
+fn urutan_sumber() -> [&'static str; 2] {
+    match env::var("DESA_SUMBER_UTAMA").ok().as_deref().map(str::to_lowercase).as_deref() {
+        Some("gee") => ["gee", "big"],
+        _ => ["big", "gee"],
+    }
+}
+
+// PROTEKSI: wajib login + memiliki kredit (dicek di auth::charge_peta).
+// Mengembalikan GeoJSON FeatureCollection seluruh desa dalam satu kabupaten (bentuk sama seperti sebelumnya).
+async fn get_desa_handler(
+    State(pool): State<PgPool>,
+    Extension(user): Extension<auth::DbUser>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, auth::ApiError> {
+    let kabupaten = params.get("kabupaten").ok_or_else(|| {
+        auth::ApiError(StatusCode::BAD_REQUEST, "Pilih kabupaten terlebih dahulu.".into())
+    })?;
+
+    if kabupaten.is_empty() || kabupaten.chars().count() > 100 {
+        return Err(auth::ApiError(StatusCode::BAD_REQUEST, "Nama kabupaten tidak valid.".into()));
+    }
+
+    let mut hasil: Option<(serde_json::Value, &str)> = None;
+    let mut kosong: Option<(serde_json::Value, &str)> = None;
+
+    for sumber in urutan_sumber() {
+        let r = match sumber {
+            "gee" => desa_gee::ambil_desa(http_client(), kabupaten)
+                .await
+                .map_err(|e| e.to_string()),
+            _ => ambil_desa_big(kabupaten).await,
+        };
+
+        match r {
+            Ok(g) if jumlah_fitur(&g) > 0 => {
+                hasil = Some((g, sumber));
+                break;
+            }
+            Ok(g) => {
+                eprintln!("Sumber '{sumber}' mengembalikan 0 desa untuk '{kabupaten}', mencoba sumber lain");
+                if kosong.is_none() {
+                    kosong = Some((g, sumber));
+                }
+            }
+            Err(e) => eprintln!("Sumber '{sumber}' gagal untuk '{kabupaten}': {e}"),
+        }
+    }
+
+    // Bila tidak ada hasil berisi: kembalikan hasil kosong yang valid (kabupaten tidak ada di data),
+    // dan hanya galat bila SEMUA sumber gagal.
+    let (mut geojson, sumber) = hasil.or(kosong).ok_or_else(big_gagal)?;
+    geojson["sumber"] = serde_json::json!(sumber); // anggota tambahan GeoJSON; "big" atau "gee"
 
     // Pengecekan kredit dilakukan SETELAH data berhasil diambil (seperti sebelumnya).
     auth::charge_peta(&pool, &user, kabupaten).await?;
