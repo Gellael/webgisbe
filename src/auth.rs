@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -17,8 +17,8 @@ use sqlx::PgPool;
 use std::{
     collections::HashMap,
     env,
-    sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SCHEMA: &str = r#"
@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS users (
 -- (kolom ditambah dengan DEFAULT true, lalu default diganti false untuk pendaftar baru).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE users ALTER COLUMN email_verified SET DEFAULT false;
+
+-- Login Google via Firebase: uid Firebase yang permanen untuk satu akun Google
+ALTER TABLE users ADD COLUMN IF NOT EXISTS firebase_uid TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS users_firebase_uid_key ON users (firebase_uid) WHERE firebase_uid IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS email_verifications (
     user_id      BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -738,6 +742,180 @@ pub async fn reset_password(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+
+    Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }))
+}
+
+// ===================== LOGIN GOOGLE (lewat Firebase Authentication) =====================
+const FIREBASE_JWK_URL: &str =
+    "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
+const JWK_TTL: Duration = Duration::from_secs(3600);
+
+struct JwkCache {
+    fetched: Option<Instant>,
+    keys: HashMap<String, (String, String)>, // kid -> (n, e)
+}
+
+fn jwk_cache() -> &'static Mutex<JwkCache> {
+    static C: OnceLock<Mutex<JwkCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(JwkCache { fetched: None, keys: HashMap::new() }))
+}
+
+/// Ambil kunci publik Firebase untuk `kid` (di-cache 1 jam; diambil ulang bila kid tidak dikenal).
+async fn firebase_key(kid: &str) -> Result<(String, String), ApiError> {
+    {
+        let c = jwk_cache().lock().unwrap();
+        if c.fetched.map_or(false, |t| t.elapsed() < JWK_TTL) {
+            if let Some(k) = c.keys.get(kid) {
+                return Ok(k.clone());
+            }
+        }
+    }
+    let gagal = |e: String| {
+        eprintln!("Gagal mengambil kunci Firebase: {e}");
+        ApiError(StatusCode::BAD_GATEWAY, "Tidak dapat menghubungi Google. Coba lagi nanti.".into())
+    };
+    let jwks: Value = crate::http_client()
+        .get(FIREBASE_JWK_URL)
+        .send()
+        .await
+        .map_err(|e| gagal(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| gagal(e.to_string()))?;
+
+    let mut keys = HashMap::new();
+    if let Some(arr) = jwks.get("keys").and_then(|k| k.as_array()) {
+        for k in arr {
+            if let (Some(id), Some(n), Some(e)) = (k["kid"].as_str(), k["n"].as_str(), k["e"].as_str()) {
+                keys.insert(id.to_string(), (n.to_string(), e.to_string()));
+            }
+        }
+    }
+    let found = keys.get(kid).cloned();
+    {
+        let mut c = jwk_cache().lock().unwrap();
+        c.keys = keys;
+        c.fetched = Some(Instant::now());
+    }
+    found.ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Token Google tidak valid.".into()))
+}
+
+#[derive(Deserialize)]
+pub struct GoogleReq {
+    id_token: String,
+}
+
+#[derive(Deserialize)]
+struct FbSignIn {
+    sign_in_provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FbClaims {
+    sub: String,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    name: Option<String>,
+    firebase: Option<FbSignIn>,
+}
+
+/// Terima ID token Firebase, verifikasi tanda tangan + audience + issuer, lalu masuk / buat akun.
+pub async fn google_login(
+    State(pool): State<PgPool>,
+    Json(req): Json<GoogleReq>,
+) -> Result<Json<AuthResp>, ApiError> {
+    let project_id = env::var("FIREBASE_PROJECT_ID").map_err(|_| {
+        eprintln!("FIREBASE_PROJECT_ID belum diset");
+        ApiError::server()
+    })?;
+    let project_id = project_id.trim().to_string();
+    let token = req.id_token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(ApiError::bad("Token Google tidak valid."));
+    }
+    let invalid = || ApiError(StatusCode::UNAUTHORIZED, "Token Google tidak valid atau kedaluwarsa.".into());
+
+    // Verifikasi dilakukan SEBELUM menyentuh database, supaya koneksi pool (hanya 2) tidak tertahan.
+    let header = decode_header(token).map_err(|_| invalid())?;
+    if header.alg != Algorithm::RS256 {
+        return Err(invalid());
+    }
+    let kid = header.kid.ok_or_else(invalid)?;
+    let (modulus, exponent) = firebase_key(&kid).await?;
+
+    let mut v = Validation::new(Algorithm::RS256);
+    v.set_audience(&[project_id.as_str()]);
+    v.set_issuer(&[format!("https://securetoken.google.com/{project_id}")]);
+    let key = DecodingKey::from_rsa_components(&modulus, &exponent).map_err(|_| invalid())?;
+    let claims = decode::<FbClaims>(token, &key, &v)
+        .map_err(|e| {
+            eprintln!("Token Firebase ditolak: {e}");
+            invalid()
+        })?
+        .claims;
+
+    // Hanya terima login lewat Google (bukan provider lain bila suatu saat diaktifkan di Firebase)
+    if claims.firebase.as_ref().and_then(|f| f.sign_in_provider.as_deref()) != Some("google.com") {
+        return Err(invalid());
+    }
+    if claims.email_verified != Some(true) {
+        return Err(ApiError::bad("Email akun Google ini belum terverifikasi."));
+    }
+    let uid = claims.sub;
+    let email = claims.email.unwrap_or_default().trim().to_lowercase();
+    if uid.is_empty() || !email.contains('@') || email.len() > 120 {
+        return Err(ApiError::bad("Data akun Google tidak lengkap."));
+    }
+    let name = claims.name.unwrap_or_default();
+    let raw = name.trim();
+    let raw = if raw.is_empty() { email.split('@').next().unwrap_or("Pengguna") } else { raw };
+    let nama: String = raw.chars().take(80).collect();
+
+    // 1) Sudah pernah masuk dengan Google -> cari lewat uid (tahan terhadap perubahan email)
+    let by_uid: Option<DbUser> = sqlx::query_as(
+        "SELECT id, email, nama, password_hash, role, kredit FROM users WHERE firebase_uid = $1",
+    )
+    .bind(&uid)
+    .fetch_optional(&pool)
+    .await?;
+
+    let user = match by_uid {
+        Some(u) => u,
+        None => {
+            let is_admin = env::var("ADMIN_EMAIL")
+                .map(|a| a.trim().to_lowercase() == email)
+                .unwrap_or(false);
+            let role = if is_admin { "admin" } else { "user" };
+
+            // 2) Akun baru, atau email sudah ada -> tautkan (atomik dalam satu query).
+            // '!google' bukan hash argon2 yang valid, jadi verify_pw() selalu gagal: akun ini tidak
+            // bisa masuk dengan kata sandi sampai user memakai "Lupa kata sandi".
+            // Jika akun lama belum terverifikasi, kata sandinya DIBUANG supaya orang yang
+            // mendaftarkan email korban lebih dulu tidak tetap memegang akun itu.
+            let u: Option<DbUser> = sqlx::query_as(
+                "INSERT INTO users (email, nama, password_hash, role, email_verified, firebase_uid)
+                 VALUES ($1, $2, '!google', $3, true, $4)
+                 ON CONFLICT (email) DO UPDATE SET
+                   firebase_uid = EXCLUDED.firebase_uid,
+                   email_verified = true,
+                   password_hash = CASE WHEN users.email_verified
+                                        THEN users.password_hash
+                                        ELSE EXCLUDED.password_hash END
+                 WHERE users.firebase_uid IS NULL
+                 RETURNING id, email, nama, password_hash, role, kredit",
+            )
+            .bind(&email)
+            .bind(&nama)
+            .bind(role)
+            .bind(&uid)
+            .fetch_optional(&pool)
+            .await?;
+            u.ok_or_else(|| {
+                ApiError(StatusCode::CONFLICT, "Email ini sudah tertaut ke akun Google lain.".into())
+            })?
+        }
+    };
 
     Ok(Json(AuthResp { token: make_token(user.id)?, user: user.into() }))
 }
