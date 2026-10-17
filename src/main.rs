@@ -35,7 +35,7 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(25))
+            .timeout(Duration::from_secs(90))
             .build()
             .expect("Gagal membuat HTTP client")
     })
@@ -300,7 +300,7 @@ async fn main() {
             "/api/osm-cache",
             get(osm_cache_get_handler).post(osm_cache_post_handler),
         )
-        .route("/api/gee-tiles", get(gee::gee_tiles))
+        .route("/api/gee-tiles", post(gee::gee_tiles))
         // ---- Admin (dicek lagi di dalam handler) ----
         .route("/api/admin/users", get(auth::admin_users_search))
         .route("/api/admin/kredit", post(auth::admin_add_kredit))
