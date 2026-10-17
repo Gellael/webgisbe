@@ -279,7 +279,6 @@ async fn main() {
     let public_email = Router::new()
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
-        .route("/api/auth/google", post(auth::google_login))
         .route("/api/auth/verify", post(auth::verify_email))   
         .route("/api/auth/resend", post(auth::resend_code))
         .route("/api/auth/forgot", post(auth::forgot_password))
@@ -291,8 +290,7 @@ async fn main() {
     // ---- Rute publik lainnya ----
     let public = Router::new()
         .route("/api/get-wilayah", get(get_wilayah_handler))
-        .route("/api/auth/login", post(auth::login))
-        .route("/api/auth/verify", post(auth::verify_email))
+        .route("/api/auth/google", post(auth::google_login))
         .route("/api/auth/reset", post(auth::reset_password));
     let protected = Router::new()
         .route("/api/me", get(auth::me))
