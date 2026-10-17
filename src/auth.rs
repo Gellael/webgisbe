@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS email_verifications (
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Penghitung pengiriman kode per akun (batas jumlah kirim per jendela waktu)
+ALTER TABLE email_verifications ADD COLUMN IF NOT EXISTS send_count   INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE email_verifications ADD COLUMN IF NOT EXISTS window_start TIMESTAMPTZ NOT NULL DEFAULT now();
 
 -- Kode reset kata sandi (dipisah dari email_verifications supaya kode verifikasi tidak bisa dipakai untuk reset)
 CREATE TABLE IF NOT EXISTS password_resets (
@@ -53,6 +56,8 @@ CREATE TABLE IF NOT EXISTS password_resets (
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS send_count   INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS window_start TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS topup_requests (
     id               BIGSERIAL PRIMARY KEY,
@@ -239,6 +244,8 @@ fn require_admin(user: &DbUser) -> Result<(), ApiError> {
 const CODE_TTL_MIN: i32 = 15; // masa berlaku kode (menit)
 const RESEND_COOLDOWN_SEC: f64 = 60.0; // jeda minimal antar pengiriman kode
 const MAX_ATTEMPTS: i32 = 5; // salah input maksimal per kode
+const MAX_SENDS: i32 = 3; // maksimal pengiriman kode per akun dalam satu jendela
+const SEND_WINDOW_MIN: i32 = 15; // lebar jendela pembatas pengiriman (menit)
 
 /// Kode disimpan sebagai hash (bukan teks asli), diikat ke user_id + JWT_SECRET.
 fn hash_code(user_id: i64, code: &str) -> String {
@@ -366,29 +373,81 @@ async fn send_code_email(to: &str, nama: &str, code: &str, reset: bool) -> Resul
     mailer.send(msg).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Buat kode baru lalu kirim ke email. Ditolak (429) jika masih dalam masa jeda.
-async fn issue_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
-    let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
-    let r = sqlx::query(
-        "INSERT INTO email_verifications (user_id, code_hash, expires_at, attempts, last_sent_at)
-         VALUES ($1, $2, now() + make_interval(mins => $3), 0, now())
-         ON CONFLICT (user_id) DO UPDATE
-           SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at,
-               attempts = 0, last_sent_at = now()
-           WHERE email_verifications.last_sent_at < now() - make_interval(secs => $4)",
-    )
-    .bind(user.id)
-    .bind(hash_code(user.id, &code))
-    .bind(CODE_TTL_MIN)
+/// Simpan kode baru ke `tabel` ("email_verifications" / "password_resets") secara ATOMIK.
+/// Baris hanya diperbarui bila:
+///   1) sudah lewat jeda RESEND_COOLDOWN_SEC sejak pengiriman terakhir, dan
+///   2) jumlah pengiriman dalam jendela SEND_WINDOW_MIN menit belum mencapai MAX_SENDS.
+/// Kalau tidak, ditolak dengan 429 dan kode lama tetap berlaku (tidak tertimpa).
+async fn simpan_kode(
+    pool: &PgPool,
+    tabel: &'static str,
+    user_id: i64,
+    code_hash: String,
+) -> Result<(), ApiError> {
+    // `tabel` selalu konstanta dari kode ini (bukan input pengguna), jadi aman disisipkan ke SQL.
+    let sql = format!(
+        "INSERT INTO {t} (user_id, code_hash, expires_at, attempts, last_sent_at, send_count, window_start)
+         VALUES ($1, $2, now() + make_interval(mins => $3), 0, now(), 1, now())
+         ON CONFLICT (user_id) DO UPDATE SET
+           code_hash    = EXCLUDED.code_hash,
+           expires_at   = EXCLUDED.expires_at,
+           attempts     = 0,
+           last_sent_at = now(),
+           send_count   = CASE WHEN {t}.window_start < now() - make_interval(mins => $5)
+                               THEN 1 ELSE {t}.send_count + 1 END,
+           window_start = CASE WHEN {t}.window_start < now() - make_interval(mins => $5)
+                               THEN now() ELSE {t}.window_start END
+         WHERE {t}.last_sent_at < now() - make_interval(secs => $4)
+           AND ({t}.window_start < now() - make_interval(mins => $5) OR {t}.send_count < $6)",
+        t = tabel
+    );
+    let r = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(code_hash)
+        .bind(CODE_TTL_MIN)
+        .bind(RESEND_COOLDOWN_SEC)
+        .bind(SEND_WINDOW_MIN)
+        .bind(MAX_SENDS)
+        .execute(pool)
+        .await?;
+    if r.rows_affected() > 0 {
+        return Ok(());
+    }
+
+    // Ditolak: cari tahu apakah karena jeda 60 detik atau karena kuota habis, supaya pesannya tepat.
+    let info: Option<(i64, i32, i64)> = sqlx::query_as(&format!(
+        "SELECT
+           GREATEST(0, CEIL(EXTRACT(EPOCH FROM (last_sent_at + make_interval(secs => $2::float8) - now()))))::bigint,
+           send_count,
+           GREATEST(0, CEIL(EXTRACT(EPOCH FROM (window_start + make_interval(mins => $3::int) - now()))))::bigint
+         FROM {tabel} WHERE user_id = $1"
+    ))
+    .bind(user_id)
     .bind(RESEND_COOLDOWN_SEC)
-    .execute(pool)
+    .bind(SEND_WINDOW_MIN)
+    .fetch_optional(pool)
     .await?;
-    if r.rows_affected() == 0 {
+    let (cooldown, jumlah, sisa_jendela) = info.unwrap_or((60, 0, 0));
+
+    if jumlah >= MAX_SENDS && sisa_jendela > 0 {
+        let menit = (sisa_jendela + 59) / 60;
         return Err(ApiError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Tunggu sekitar 1 menit sebelum meminta kode baru.".into(),
+            format!(
+                "Permintaan kode sudah mencapai batas {MAX_SENDS} kali. Coba lagi sekitar {menit} menit lagi."
+            ),
         ));
     }
+    Err(ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("Tunggu {} detik sebelum meminta kode baru.", cooldown.max(1)),
+    ))
+}
+
+/// Buat kode baru lalu kirim ke email. Ditolak (429) jika kena jeda atau kuota kirim habis.
+async fn issue_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
+    let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
+    simpan_kode(pool, "email_verifications", user.id, hash_code(user.id, &code)).await?;
     send_code_email(&user.email, &user.nama, &code, false).await.map_err(|e| {
         eprintln!("Gagal kirim email verifikasi ke {}: {e}", user.email);
         ApiError(StatusCode::BAD_GATEWAY, "Gagal mengirim email verifikasi. Coba lagi nanti.".into())
@@ -574,29 +633,10 @@ fn hash_reset_code(user_id: i64, code: &str) -> String {
     format!("{:x}", Sha256::digest(input.as_bytes()))
 }
 
-/// Buat kode reset baru lalu kirim ke email. Ditolak (429) jika masih dalam masa jeda.
+/// Buat kode reset baru lalu kirim ke email. Ditolak (429) jika kena jeda atau kuota kirim habis.
 async fn issue_reset_code(pool: &PgPool, user: &DbUser) -> Result<(), ApiError> {
     let code = format!("{:06}", OsRng.next_u32() % 1_000_000);
-    let r = sqlx::query(
-        "INSERT INTO password_resets (user_id, code_hash, expires_at, attempts, last_sent_at)
-         VALUES ($1, $2, now() + make_interval(mins => $3), 0, now())
-         ON CONFLICT (user_id) DO UPDATE
-           SET code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at,
-               attempts = 0, last_sent_at = now()
-           WHERE password_resets.last_sent_at < now() - make_interval(secs => $4)",
-    )
-    .bind(user.id)
-    .bind(hash_reset_code(user.id, &code))
-    .bind(CODE_TTL_MIN)
-    .bind(RESEND_COOLDOWN_SEC)
-    .execute(pool)
-    .await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Tunggu sekitar 1 menit sebelum meminta kode baru.".into(),
-        ));
-    }
+    simpan_kode(pool, "password_resets", user.id, hash_reset_code(user.id, &code)).await?;
     send_code_email(&user.email, &user.nama, &code, true).await.map_err(|e| {
         eprintln!("Gagal kirim email reset ke {}: {e}", user.email);
         ApiError(StatusCode::BAD_GATEWAY, "Gagal mengirim email. Coba lagi nanti.".into())

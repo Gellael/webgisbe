@@ -17,6 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 mod auth;
 mod desa_gee;
 mod gee;
+mod ratelimit;
 
 // ===================== DATA DESA DARI BIG (tanpa database) =====================
 // Batas desa/kelurahan tidak lagi disimpan di Aiven. Data diambil langsung dari layanan resmi BIG
@@ -264,19 +265,31 @@ async fn main() {
         .await
         .expect("Gagal membuat tabel autentikasi.");
 
+    // Tabel penghitung rate limit per IP
+    ratelimit::ensure_schema(&pool)
+        .await
+        .expect("Gagal membuat tabel rate_limit.");
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
-    // ---- Rute publik ----
-    let public = Router::new()
-        .route("/api/get-wilayah", get(get_wilayah_handler))
+    // ---- Rute publik yang MENGIRIM EMAIL (dibatasi per IP) ----
+    let public_email = Router::new()
         .route("/api/auth/register", post(auth::register))
-        .route("/api/auth/login", post(auth::login))
-        .route("/api/auth/verify", post(auth::verify_email))   
         .route("/api/auth/resend", post(auth::resend_code))
         .route("/api/auth/forgot", post(auth::forgot_password))
+        .route_layer(middleware::from_fn_with_state(
+            pool.clone(),
+            ratelimit::limit_email,
+        ));
+
+    // ---- Rute publik lainnya ----
+    let public = Router::new()
+        .route("/api/get-wilayah", get(get_wilayah_handler))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/verify", post(auth::verify_email))
         .route("/api/auth/reset", post(auth::reset_password));
     let protected = Router::new()
         .route("/api/me", get(auth::me))
@@ -294,6 +307,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(public)
+        .merge(public_email)
         .merge(protected)
         .layer(cors)
         .with_state(pool);
