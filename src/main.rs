@@ -278,12 +278,9 @@ async fn main() {
     // ---- Rute publik yang MENGIRIM EMAIL (dibatasi per IP) ----
     let public_email = Router::new()
         .route("/api/auth/register", post(auth::register))
-<<<<<<< HEAD
-=======
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/google", post(auth::google_login))
         .route("/api/auth/verify", post(auth::verify_email))   
->>>>>>> login-google
         .route("/api/auth/resend", post(auth::resend_code))
         .route("/api/auth/forgot", post(auth::forgot_password))
         .route_layer(middleware::from_fn_with_state(
